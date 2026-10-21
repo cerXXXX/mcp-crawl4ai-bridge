@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""
+MCP Stdio-to-SSE Bridge for Crawl4AI
+Bridges local stdio MCP protocol to remote Crawl4AI SSE server.
+
+The SSE transport creates a new server-side session on every (re)connect.
+MCP state (initialize handshake) is per-session, so after a reconnect the
+session must be initialized again before any other request is sent.
+This bridge caches the initialize/initialized messages and replays them
+on every new SSE session.
+"""
+
+import os
+import sys
+import json
+import urllib.request
+import urllib.error
+import threading
+import time
+
+CRAWL4AI_URL = os.environ.get("CRAWL4AI_URL", "http://127.0.0.1:11235").rstrip("/")
+CRAWL4AI_TOKEN = os.environ.get("CRAWL4AI_TOKEN", "")
+CRAWL4AI_SSE_PATH = os.environ.get("CRAWL4AI_SSE_PATH", "/mcp/sse")
+BRIDGE_INIT_ID = "bridge-reinit"
+
+sse_url = f"{CRAWL4AI_URL}{CRAWL4AI_SSE_PATH}"
+headers = {}
+if CRAWL4AI_TOKEN:
+    headers["Authorization"] = f"Bearer {CRAWL4AI_TOKEN}"
+
+post_url = None
+post_lock = threading.Lock()
+endpoint_ready = threading.Event()
+shutdown_event = threading.Event()
+current_resp = None
+current_resp_lock = threading.Lock()
+session_gen = 0
+initialized_gen = 0
+init_request = None
+init_notification = None
+
+
+def log(msg):
+    sys.stderr.write(f"[crawl4ai-bridge] {msg}\n")
+    sys.stderr.flush()
+
+
+def force_reconnect():
+    with current_resp_lock:
+        resp = current_resp
+    if resp is not None:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def post_message(line, target_url):
+    req = urllib.request.Request(
+        target_url,
+        data=line.encode("utf-8"),
+        headers={**headers, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60):
+        pass
+
+
+def sse_reader():
+    global post_url, current_resp, session_gen
+    while not shutdown_event.is_set():
+        resp = None
+        try:
+            req = urllib.request.Request(sse_url, headers=headers)
+            resp = urllib.request.urlopen(req, timeout=30)
+            with current_resp_lock:
+                current_resp = resp
+            endpoint_ready.clear()
+            current_event = "message"
+            current_data = []
+            for line_bytes in resp:
+                if shutdown_event.is_set():
+                    break
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    if current_event == "endpoint" and current_data:
+                        ep = "".join(current_data).strip()
+                        if ep.startswith("http://") or ep.startswith("https://"):
+                            post_url = ep
+                        else:
+                            post_url = f"{CRAWL4AI_URL}{ep}"
+                        session_gen += 1
+                        log(f"Connected. Session #{session_gen}: {post_url}")
+                        endpoint_ready.set()
+                    elif current_event == "message" and current_data:
+                        msg = "".join(current_data)
+                        try:
+                            obj = json.loads(msg)
+                            if obj.get("id") == BRIDGE_INIT_ID:
+                                msg = None
+                        except Exception:
+                            pass
+                        if msg is not None:
+                            sys.stdout.write(msg + "\n")
+                            sys.stdout.flush()
+                    current_event = "message"
+                    current_data = []
+                elif line.startswith("event: "):
+                    current_event = line[7:].strip()
+                elif line.startswith("data: "):
+                    current_data.append(line[6:].strip())
+        except Exception as e:
+            if shutdown_event.is_set():
+                break
+            log(f"SSE connection error: {e}. Retrying in 2s...")
+        finally:
+            with current_resp_lock:
+                current_resp = None
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            endpoint_ready.clear()
+        if not shutdown_event.is_set():
+            time.sleep(2)
+
+
+def ensure_initialized(target_url, gen):
+    global initialized_gen
+    if initialized_gen == gen:
+        return True
+    if init_request is None:
+        return True
+    try:
+        obj = json.loads(init_request)
+        obj["id"] = BRIDGE_INIT_ID
+        log(f"Re-initializing session #{gen}")
+        post_message(json.dumps(obj), target_url)
+        if init_notification is not None:
+            post_message(init_notification, target_url)
+        initialized_gen = gen
+        return True
+    except Exception as e:
+        log(f"Re-initialize failed: {e}")
+        return False
+
+
+def wait_for_endpoint(timeout=20):
+    if endpoint_ready.wait(timeout=timeout):
+        return True
+    log("Timeout waiting for SSE endpoint")
+    return False
+
+
+def main():
+    global init_request, init_notification, initialized_gen
+    threading.Thread(target=sse_reader, daemon=True).start()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        method = None
+        try:
+            method = json.loads(line).get("method")
+        except Exception:
+            pass
+
+        if method == "initialize":
+            init_request = line
+        elif method == "notifications/initialized":
+            init_notification = line
+
+        for attempt in range(2):
+            if not wait_for_endpoint():
+                break
+            try:
+                with post_lock:
+                    target_url, gen = post_url, session_gen
+                    if method not in ("initialize", "notifications/initialized"):
+                        ensure_initialized(target_url, gen)
+                    post_message(line, target_url)
+                if method == "initialize":
+                    initialized_gen = session_gen
+                break
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                log(f"HTTP error {e.code} posting message: {body}")
+                if e.code in (400, 404) and attempt == 0:
+                    endpoint_ready.clear()
+                    force_reconnect()
+                    continue
+                break
+            except Exception as e:
+                log(f"Error posting message: {e}")
+                break
+
+    shutdown_event.set()
+    force_reconnect()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
